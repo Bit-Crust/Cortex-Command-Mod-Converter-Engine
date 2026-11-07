@@ -2331,10 +2331,14 @@ fn writeAstRecursively(node: *Node, buffered_writer: anytype, depth: usize) !voi
 
     if (node.property) |property| {
         try writeBuffered(buffered_writer, property);
+
+        // Named properties with values, and AddLine (for empty lines in MultiLineText), require the equality symbol.
+        if (node.value != null or strEql(property, "AddLine")) {
+            try writeBuffered(buffered_writer, " = ");
+        }
     }
 
     if (node.value) |value| {
-        try writeBuffered(buffered_writer, " = ");
         try writeBuffered(buffered_writer, value);
     }
 
