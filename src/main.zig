@@ -9,7 +9,7 @@ const page_allocator = std.heap.page_allocator;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const ArrayList = std.ArrayList;
-const StringArrayHashMap = std.StringArrayHashMap;
+const HashMap = std.hash_map.HashMap;
 const MultiArrayList = std.MultiArrayList;
 const Scanner = std.json.Scanner;
 const StringHashMap = std.hash_map.StringHashMap;
@@ -20,7 +20,6 @@ const bufferedReader = std.io.bufferedReader;
 const bufferedWriter = std.io.bufferedWriter;
 const copyFileAbsolute = std.fs.copyFileAbsolute;
 const endsWith = std.mem.endsWith;
-const indexOf = std.mem.indexOf;
 const eql = std.mem.eql;
 const expectEqualStrings = std.testing.expectEqualStrings;
 const extension = std.fs.path.extension;
@@ -124,13 +123,6 @@ const IniFolder = struct {
     folders: ArrayList(IniFolder),
 };
 
-// A module space is a list of mappings, ClassName to PresetName-set.
-// As well as a module name, taken from the actual folder name.
-const ModuleSpace = struct {
-    entityDefinitions: *StringArrayHashMap(*StringArrayHashMap(void)),
-    moduleName: []const u8,
-};
-
 /// Updated by `convert()` to record what it is doing.
 /// If `convert()` crashed, look inside this struct to see why and where it did.
 pub const Diagnostics = struct {
@@ -180,10 +172,6 @@ pub fn main() !void {
             std.log.info("Error: Invalid output path", .{});
             return err;
         },
-        error.InvalidRulesPath => {
-            std.log.info("Error: Invalid rules path", .{});
-            return err;
-        },
         error.UnexpectedToken => {
             std.log.info("Error: Unexpected '{s}' at {s}:{}:{}\n", .{
                 diagnostics.token orelse "null",
@@ -228,7 +216,7 @@ pub fn convert(input_folder_path_: []const u8, output_folder_path_: []const u8, 
     // https://github.com/ziglang/zig/issues/15607#issue-1698930560
     if (!try isValidDirPath(input_folder_path_)) return error.InvalidInputPath;
     if (!try isValidDirPath(output_folder_path_)) return error.InvalidOutputPath;
-    if (!try isValidDirPath(rules_folder_path_)) return error.InvalidRulesPath;
+    if (!try isValidDirPath(rules_folder_path_)) return error.InvalidOutputPath;
 
     const input_folder_path = try std.fs.realpathAlloc(allocator, input_folder_path_);
     const output_folder_path = try std.fs.realpathAlloc(allocator, output_folder_path_);
@@ -296,13 +284,6 @@ pub fn convert(input_folder_path_: []const u8, output_folder_path_: []const u8, 
     const ini_sound_container_rules = try parseIniSoundContainerRules(rules_folder_path, allocator);
     std.log.info("Applying INI SoundContainer rules...\n", .{});
     applyIniSoundContainerRules(ini_sound_container_rules, &file_tree);
-
-    const ini_deinlining_rules = try parseIniDeinliningRules(rules_folder_path, allocator);
-    std.log.info("Applying INI de-inlining rules...\n", .{});
-    const entityDefinitionSets: *ArrayList(*ModuleSpace) = try allocator.create(ArrayList(*ModuleSpace));
-    entityDefinitionSets.* = ArrayList(*ModuleSpace).init(allocator);
-    try populateEntityDefinitionSets(allocator, &file_tree, entityDefinitionSets);
-    try applyIniDeinliningRules(allocator, ini_deinlining_rules, &file_tree, entityDefinitionSets);
 
     std.log.info("Updating INI file tree...\n", .{});
     try updateIniFileTree(&file_tree, allocator);
@@ -1403,226 +1384,6 @@ fn applyIniSoundContainerRulesRecursivelyNode(node: *Node, property: []const u8)
     }
 }
 
-fn parseIniDeinliningRules(rules_folder_path: []const u8, allocator: Allocator) ![][]const u8 {
-    const ini_deinlining_rules_path = try join(allocator, &.{ rules_folder_path, "ini_deinlining_rules.json" });
-    const text = try readFile(ini_deinlining_rules_path, allocator);
-    return try parseFromSliceLeaky([][]const u8, allocator, text, .{});
-}
-
-fn populateEntityDefinitionSets(allocator: Allocator, file_tree: *IniFolder, modules: *ArrayList(*ModuleSpace)) !void {
-    for (file_tree.folders.items) |*folder| {
-        const entityDefinitions: *StringArrayHashMap(*StringArrayHashMap(void)) = try allocator.create(StringArrayHashMap(*StringArrayHashMap(void)));
-        entityDefinitions.* = StringArrayHashMap(*StringArrayHashMap(void)).init(allocator);
-
-        try populateEntityDefinitionSetsRecursively(allocator, folder, entityDefinitions);
-
-        const module: *ModuleSpace = try allocator.create(ModuleSpace);
-        module.* = ModuleSpace{
-            .moduleName = folder.name,
-            .entityDefinitions = entityDefinitions,
-        };
-
-        try modules.append(module);
-    }
-}
-
-fn populateEntityDefinitionSetsRecursively(allocator: Allocator, moduleFolder: *IniFolder, entitySpace: *StringArrayHashMap(*StringArrayHashMap(void))) !void {
-    for (moduleFolder.folders.items) |*folder| {
-        try populateEntityDefinitionSetsRecursively(allocator, folder, entitySpace);
-    }
-
-    for (moduleFolder.files.items) |*file| {
-        for (file.ast.items) |*node| {
-            try populateEntityDefinitionSetsNode(allocator, node, entitySpace);
-        }
-    }
-}
-
-fn populateEntityDefinitionSetsNode(allocator: Allocator, serialNode: *Node, entitySpace: *StringArrayHashMap(*StringArrayHashMap(void))) !void {
-    // Assume this isn't an Entity with a PresetName.
-    var presetName: ?[]const u8 = null;
-
-    // Find out if it does specify a PresetName, and record it if so.
-    for (serialNode.children.items) |*node| {
-        if (node.property) |nodeProperty| {
-            if (strEql(nodeProperty, "PresetName")) {
-                if (node.value) |nodeValue| {
-                    presetName = nodeValue;
-                }
-            }
-        }
-    }
-
-    // If this has a specified PresetName, then this is an Entity from this module, which will be useful for accurate de-inlining.
-    if (presetName) |presetNameNonOptional| {
-        if (serialNode.value) |serialNodeValue| {
-            var presetSpace: *StringArrayHashMap(void) = entitySpace.get(serialNodeValue) orelse emplaceEntitySpace: {
-                const presetSpace: *StringArrayHashMap(void) = try allocator.create(StringArrayHashMap(void));
-                presetSpace.* = StringArrayHashMap(void).init(allocator);
-                try entitySpace.put(serialNodeValue, presetSpace);
-                break :emplaceEntitySpace presetSpace;
-            };
-
-            try presetSpace.put(presetNameNonOptional, {});
-        }
-    }
-
-    for (serialNode.children.items) |*node| {
-        try populateEntityDefinitionSetsNode(allocator, node, entitySpace);
-    }
-}
-
-fn applyIniDeinliningRules(allocator: Allocator, ini_deinlining_rules: [][]const u8, file_tree: *IniFolder, modules: *ArrayList(*ModuleSpace)) !void {
-    for (file_tree.folders.items, 0..) |*moduleFolder, moduleID| {
-        for (ini_deinlining_rules) |property| {
-            try applyIniDeinliningRulesRecursivelyFolder(allocator, moduleFolder, property, modules.items[moduleID]);
-        }
-    }
-}
-
-fn applyIniDeinliningRulesRecursivelyFolder(allocator: Allocator, file_tree: *IniFolder, property: []const u8, moduleSpace: *ModuleSpace) !void {
-    for (file_tree.folders.items) |*folder| {
-        try applyIniDeinliningRulesRecursivelyFolder(allocator, folder, property, moduleSpace);
-    }
-
-    for (file_tree.files.items) |*file| {
-        // This is kind of hideous. Loop through each item in the list.
-        var i: usize = 0;
-        while (i < file.ast.items.len) {
-            const node: *Node = &file.ast.items[i];
-            i = i + 1;
-
-            // Instead of looping over all nodes, loop over the children of each node.
-            // Why necessary? Because some unused inis use the word "Particle" as a root property.
-            // This is safe, however, because there should never be any lone constant references at root property level.
-            for (node.children.items) |*child| {
-                // Deinlining a definition into the file will push the current object further forward.
-                const insertionApplied: bool = try applyIniDeinliningRulesRecursivelyNode(allocator, child, property, file, node.*, moduleSpace);
-
-                // We want to read the object again, since we stopped after the deinline, but we also want to read the definition that was deinlined.
-                // So decrement i.
-                if (insertionApplied) {
-                    i = i - 1;
-                    break;
-                }
-            }
-        }
-    }
-}
-
-fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, property: []const u8, file: *IniFile, rootParent: Node, moduleSpace: *ModuleSpace) !bool {
-    if (node.property) |nodeProperty| {
-        if (node.value) |nodeValue| {
-            if (strEql(nodeProperty, property)) {
-                if (node.children.items.len > 0) {
-                    const className: []const u8 = nodeValue;
-                    var moduleNameOptional: ?[]const u8 = null;
-                    var presetNameOptional: ?[]const u8 = null;
-
-                    var isOriginalPreset: bool = false;
-                    var isCopyOf: bool = false;
-
-                    // A CopyOf changes what the constant reference will point to,
-                    // unless it is following a PresetName, which is assumed to be a mistake.
-                    // A PresetName always changes the pointing of the constant reference.
-                    for (node.children.items) |*child| {
-                        if (child.property) |childProperty| {
-                            const readingCopyOf: bool = strEql(childProperty, "CopyOf");
-                            const readingOriginalPreset: bool = strEql(childProperty, "PresetName");
-                            isCopyOf = isCopyOf or readingCopyOf;
-                            isOriginalPreset = isOriginalPreset or readingOriginalPreset;
-
-                            if ((readingCopyOf and !isOriginalPreset) or readingOriginalPreset) {
-                                presetNameOptional = child.value;
-                            }
-                        }
-                    }
-
-                    // Sometimes both CopyOfs and PresetNames list the module name with the preset name, detect this.
-                    // This lets it respect when well written mods intentionally reference non-Base data entities.
-                    if (presetNameOptional) |presetName| {
-                        if (indexOf(u8, presetName, "/")) |modulePrefixEnd| {
-                            moduleNameOptional = presetName[0..modulePrefixEnd];
-                            presetNameOptional = presetName[modulePrefixEnd + 1 ..];
-                        }
-                    }
-
-                    // If this is an original preset, unless it's in a loadout, where all sorts of things seem to go wrong,
-                    // then we're going to deinline it.
-                    const deinliningFlag = isOriginalPreset and !strEql(rootParent.property.?, "AddLoadout");
-
-                    // If we're set to deinline, then we're making a new preset definition in this module.
-                    // This means the constant reference should certainly point to this module.
-                    if (deinliningFlag) {
-                        moduleNameOptional = moduleSpace.moduleName;
-
-                        const duplicateNode = Node{
-                            .property = "AddEffect",
-                            .value = node.value,
-                            .comments = try node.comments.clone(),
-                            .children = try node.children.clone(),
-                        };
-
-                        const determinedIndex = index_of(Node, file.ast.items, rootParent) orelse 0;
-                        try file.ast.insert(determinedIndex, duplicateNode);
-                    }
-
-                    // As long as we ever encountered the implication of a preset name, we can construct a constant reference.
-                    if (presetNameOptional) |presetName| {
-                        // If this was copied from something, and it isn't an original preset,
-                        // then check if it is pointing to something within this module.
-                        const moduleName: []const u8 = moduleNameOptional orelse moduleNameDeterminingBlock: {
-                            if (isCopyOf and !isOriginalPreset) {
-                                if (moduleSpace.entityDefinitions.get(className)) |presetNameSpace| {
-                                    if (presetNameSpace.get(presetName) != null) {
-                                        break :moduleNameDeterminingBlock moduleSpace.moduleName;
-                                    }
-                                }
-                            }
-                            break :moduleNameDeterminingBlock "Base.rte";
-                        };
-
-                        node.value = try allocPrint(allocator, "{s}/{s}/{s}", .{ className, moduleName, presetName });
-                    } else {
-                        node.value = "None";
-                    }
-
-                    node.children.clearRetainingCapacity();
-                    node.comments.clearRetainingCapacity();
-
-                    // In any case, this was a malformed constant reference, and it no longer has children to correct.
-                    // We signal to the caller if a definition has been deinlined, so that it can step backwards to proofread that one as well.
-                    return deinliningFlag;
-                }
-            }
-        }
-    }
-
-    // Since this isn't a malformed constant reference, check the same for this' children.
-    for (node.children.items) |*child| {
-        const sequenceInvalidated = try applyIniDeinliningRulesRecursivelyNode(allocator, child, property, file, rootParent, moduleSpace);
-
-        // We have discovered an inline definition, and corrected it, which we must immediately signal to the caller.
-        if (sequenceInvalidated) {
-            return true;
-        }
-    }
-
-    // This is not a malformed constant reference, neither does it contain any.
-    return false;
-}
-
-// Stolen off stack exchange, surprised the std library hasn't been updated to remedy the specific problem solved by this
-fn index_of(comptime T: type, slice: []const T, value: T) ?usize {
-    for (slice, 0..) |element, index| {
-        if (std.meta.eql(value, element)) {
-            return index;
-        }
-    } else {
-        return null;
-    }
-}
-
 fn updateIniFileTree(file_tree: *IniFolder, allocator: Allocator) !void {
     try applyOnNodesAlloc(addGetsHitByMosWhenHeldToShields, file_tree, allocator);
     try applyOnNodesAlloc(addGripStrength, file_tree, allocator);
@@ -2566,14 +2327,10 @@ fn writeAstRecursively(node: *Node, buffered_writer: anytype, depth: usize) !voi
 
     if (node.property) |property| {
         try writeBuffered(buffered_writer, property);
-
-        // Named properties with values, and AddLine (for empty lines in MultiLineText), require the equality symbol.
-        if (node.value != null or strEql(property, "AddLine")) {
-            try writeBuffered(buffered_writer, " = ");
-        }
     }
 
     if (node.value) |value| {
+        try writeBuffered(buffered_writer, " = ");
         try writeBuffered(buffered_writer, value);
     }
 
@@ -2623,10 +2380,6 @@ test "mod" {
 
 test "updated" {
     try testDirectory("updated", false);
-}
-
-test "constant_reference" {
-    try testDirectory("constant_reference", false);
 }
 
 fn testDirectory(comptime directory_name: []const u8, is_invalid_test: bool) !void {
