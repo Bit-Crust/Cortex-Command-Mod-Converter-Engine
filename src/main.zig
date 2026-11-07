@@ -172,6 +172,10 @@ pub fn main() !void {
             std.log.info("Error: Invalid output path", .{});
             return err;
         },
+        error.InvalidRulesPath => {
+            std.log.info("Error: Invalid rules path", .{});
+            return err;
+        },
         error.UnexpectedToken => {
             std.log.info("Error: Unexpected '{s}' at {s}:{}:{}\n", .{
                 diagnostics.token orelse "null",
@@ -216,7 +220,7 @@ pub fn convert(input_folder_path_: []const u8, output_folder_path_: []const u8, 
     // https://github.com/ziglang/zig/issues/15607#issue-1698930560
     if (!try isValidDirPath(input_folder_path_)) return error.InvalidInputPath;
     if (!try isValidDirPath(output_folder_path_)) return error.InvalidOutputPath;
-    if (!try isValidDirPath(rules_folder_path_)) return error.InvalidOutputPath;
+    if (!try isValidDirPath(rules_folder_path_)) return error.InvalidRulesPath;
 
     const input_folder_path = try std.fs.realpathAlloc(allocator, input_folder_path_);
     const output_folder_path = try std.fs.realpathAlloc(allocator, output_folder_path_);
